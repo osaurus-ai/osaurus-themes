@@ -10,12 +10,13 @@ import {
   consumeNonce,
   deleteThemeMeta,
   getThemeMeta,
+  isRedisConfigured,
   issueNonce,
   listOwnerThemes,
   removeOwnerIndex,
   saveThemeMeta,
 } from "./redis.ts";
-import { getStorage } from "./storage.ts";
+import { getStorage, isStorageConfigured } from "./storage.ts";
 import { jsonResponse, readBodyBytes } from "./http.ts";
 import type {
   ChallengeRequest,
@@ -94,10 +95,15 @@ export async function handleChallenge(req: Request): Promise<Response> {
   if (!address || !isValidAddress(address)) {
     return jsonResponse(400, { error: "invalid_address" });
   }
+  if (!isRedisConfigured()) {
+    console.error("[challenge] REDIS_URL not configured");
+    return jsonResponse(503, { error: "redis_not_configured" });
+  }
   const nonce = generateNonce();
   try {
     await issueNonce(address, nonce);
-  } catch {
+  } catch (err) {
+    console.error("[challenge] issueNonce failed:", err);
     return jsonResponse(503, { error: "storage_unavailable" });
   }
   const res: ChallengeResponse = { nonce, expires_in: 60 };
@@ -149,6 +155,10 @@ export async function handleSaveTheme(req: Request): Promise<Response> {
   const verified = await verifySignature(signed.address, message, signed.signature);
   if (!verified) return jsonResponse(401, { error: "signature_verification_failed" });
 
+  if (!isStorageConfigured()) {
+    console.error("[save] storage env vars are not fully set");
+    return jsonResponse(503, { error: "storage_not_configured" });
+  }
   const storage = getStorage();
   const contentType = "application/json";
   try {
@@ -156,7 +166,8 @@ export async function handleSaveTheme(req: Request): Promise<Response> {
     if (!existing) {
       await storage.putTheme(bodyHash, bytes, contentType);
     }
-  } catch {
+  } catch (err) {
+    console.error("[save] tigris write failed:", err);
     return jsonResponse(502, { error: "storage_write_failed" });
   }
 

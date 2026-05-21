@@ -62,12 +62,26 @@ All configured via environment variables (use Fly secrets in production):
 | `AWS_ACCESS_KEY_ID`     | yes      | Tigris access key.                                                                                                         |
 | `AWS_SECRET_ACCESS_KEY` | yes      | Tigris secret key.                                                                                                         |
 | `AWS_REGION`            | no       | Tigris region (defaults to `auto`).                                                                                        |
+| `S3_FORCE_PATH_STYLE`   | no       | Set to `1` to force path-style S3 URLs. Default off (Tigris uses virtual-hosted style).                                    |
 
 ## Endpoints
 
 ### `GET /health`
 
-Liveness check. Returns `{ "status": "ok" }`.
+Liveness + dependency check. Returns `200` when Redis and Tigris are both configured and
+reachable, `503` otherwise. The body always describes the state of each dependency so you can
+diagnose misconfiguration without leaking secrets:
+
+```json
+{
+  "status": "ok",
+  "redis": { "configured": true, "reachable": true },
+  "storage": { "configured": true, "reachable": true }
+}
+```
+
+On failure, `storage.error` contains the S3 error name + HTTP status + request ID + message, e.g.
+`AccessDenied status=403 reqId=abc message=...`.
 
 ### `POST /auth/challenge`
 

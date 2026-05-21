@@ -4,14 +4,33 @@ const NONCE_TTL_SECONDS = 60;
 
 const REDIS_URL = Deno.env.get("REDIS_URL");
 
+function redactUrl(url: string): string {
+  try {
+    const u = new URL(url);
+    if (u.password) u.password = "***";
+    return u.toString();
+  } catch {
+    return "<unparseable>";
+  }
+}
+
 let client: Redis | null = null;
 
 if (REDIS_URL) {
+  console.log(`[redis] connecting to ${redactUrl(REDIS_URL)}`);
   client = new Redis(REDIS_URL, {
-    maxRetriesPerRequest: 1,
-    enableReadyCheck: false,
+    maxRetriesPerRequest: 3,
+    connectTimeout: 10_000,
+    enableReadyCheck: true,
     lazyConnect: false,
   });
+  client.on("connect", () => console.log("[redis] connect"));
+  client.on("ready", () => console.log("[redis] ready"));
+  client.on("error", (err) => console.error("[redis] error:", err?.message ?? err));
+  client.on("end", () => console.warn("[redis] connection ended"));
+  client.on("reconnecting", (ms: number) => console.warn(`[redis] reconnecting in ${ms}ms`));
+} else {
+  console.warn("[redis] REDIS_URL is not set — all storage ops will fail");
 }
 
 // deno-lint-ignore no-explicit-any
@@ -20,8 +39,22 @@ export function _setClientForTesting(c: any): void {
 }
 
 function requireClient(): Redis {
-  if (!client) throw new Error("redis_unavailable");
+  if (!client) throw new Error("redis_not_configured");
   return client;
+}
+
+export function isRedisConfigured(): boolean {
+  return client !== null;
+}
+
+export async function pingRedis(): Promise<boolean> {
+  if (!client) return false;
+  try {
+    const reply = await client.ping();
+    return reply === "PONG";
+  } catch {
+    return false;
+  }
 }
 
 function nonceKey(nonce: string): string {

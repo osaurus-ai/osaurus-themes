@@ -8,6 +8,8 @@ import {
   handleListOwnerThemes,
   handleSaveTheme,
 } from "./themes.ts";
+import { isRedisConfigured, pingRedis } from "./redis.ts";
+import { checkBucketReachable, isStorageConfigured } from "./storage.ts";
 
 function getClientIp(req: Request, info: Deno.ServeHandlerInfo): string {
   const flyIp = req.headers.get("fly-client-ip");
@@ -34,7 +36,23 @@ export async function handleRequest(
   if (req.method === "OPTIONS") return corsPreflightResponse();
 
   if (url.pathname === "/health") {
-    return jsonResponse(200, { status: "ok" });
+    const redisConfigured = isRedisConfigured();
+    const storageConfigured = isStorageConfigured();
+    const [redisOk, storageErr] = await Promise.all([
+      redisConfigured ? pingRedis() : Promise.resolve(false),
+      storageConfigured ? checkBucketReachable() : Promise.resolve("not_configured"),
+    ]);
+    const storageOk = storageErr === null;
+    const ok = redisConfigured && redisOk && storageConfigured && storageOk;
+    return jsonResponse(ok ? 200 : 503, {
+      status: ok ? "ok" : "degraded",
+      redis: { configured: redisConfigured, reachable: redisOk },
+      storage: {
+        configured: storageConfigured,
+        reachable: storageOk,
+        error: storageErr ?? undefined,
+      },
+    });
   }
 
   if (url.pathname === "/auth/challenge" && req.method === "POST") {

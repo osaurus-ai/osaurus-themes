@@ -12,6 +12,14 @@ export class MockStorage implements StorageClient {
   headCalls = 0;
   getCalls = 0;
 
+  isConfigured(): boolean {
+    return true;
+  }
+
+  checkReachable(): Promise<string | null> {
+    return Promise.resolve(null);
+  }
+
   putTheme(hash: string, body: Uint8Array, contentType: string): Promise<void> {
     this.putCalls++;
     this.blobs.set(hash, { bytes: body, contentType });
