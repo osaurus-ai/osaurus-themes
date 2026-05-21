@@ -150,3 +150,22 @@ export async function listOwnerThemes(
   const c = requireClient();
   return await c.zrevrange(ownerIndexKey(address), offset, offset + limit - 1);
 }
+
+/**
+ * Total count of themes owned by an address.
+ */
+export async function countOwnerThemes(address: string): Promise<number> {
+  return await requireClient().zcard(ownerIndexKey(address));
+}
+
+/**
+ * Gracefully close the Redis connection (used on SIGTERM).
+ */
+export async function closeRedis(): Promise<void> {
+  if (!client) return;
+  try {
+    await client.quit();
+  } catch {
+    // already closed
+  }
+}

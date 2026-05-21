@@ -8,6 +8,7 @@ import {
 import {
   addOwnerIndex,
   consumeNonce,
+  countOwnerThemes,
   deleteThemeMeta,
   getThemeMeta,
   isRedisConfigured,
@@ -17,7 +18,7 @@ import {
   saveThemeMeta,
 } from "./redis.ts";
 import { getStorage, isStorageConfigured } from "./storage.ts";
-import { jsonResponse, readBodyBytes } from "./http.ts";
+import { jsonResponse, readBodyBytes, withTimeout } from "./http.ts";
 import type {
   ChallengeRequest,
   ChallengeResponse,
@@ -27,10 +28,26 @@ import type {
 } from "./types.ts";
 
 export const MAX_THEME_BYTES = 5 * 1024 * 1024; // 5 MB
+export const MAX_THEMES_PER_OWNER = Number(
+  Deno.env.get("MAX_THEMES_PER_OWNER") ?? "1000",
+);
+export const REQUEST_TIMEOUT_MS = Number(
+  Deno.env.get("REQUEST_TIMEOUT_MS") ?? "30000",
+);
+
 const ADDRESS_RE = /^0x[0-9a-fA-F]{40}$/;
 const HASH_RE = /^[0-9a-f]{64}$/;
 
 const BASE_URL = (Deno.env.get("BASE_URL") ?? "").replace(/\/+$/, "");
+const LOCAL_HOSTS = new Set(["localhost", "127.0.0.1", "[::1]", "0.0.0.0"]);
+
+if (!BASE_URL) {
+  console.warn(
+    "[themes] BASE_URL is not set. The install URL will be derived from the " +
+      "incoming Host header, which an attacker can spoof if the app is " +
+      "reachable outside Fly's edge. Set BASE_URL to your public origin.",
+  );
+}
 
 function isValidAddress(s: string): boolean {
   return ADDRESS_RE.test(s);
@@ -40,21 +57,36 @@ function isValidHash(s: string): boolean {
   return HASH_RE.test(s);
 }
 
+function hostOnly(host: string): string {
+  const colon = host.lastIndexOf(":");
+  if (colon > 0 && !host.startsWith("[")) return host.slice(0, colon);
+  return host;
+}
+
 function originFor(req: Request): string {
   if (BASE_URL) return BASE_URL;
   const url = new URL(req.url);
-  // Behind Fly's edge the connection to us is HTTP, but the public URL is HTTPS.
-  // Default to https unless the host looks like localhost.
   const host = req.headers.get("host") ?? url.host;
-  const proto = host.startsWith("localhost") || host.startsWith("127.") ? "http" : "https";
+  const proto = LOCAL_HOSTS.has(hostOnly(host)) ? "http" : "https";
   return `${proto}://${host}`;
 }
 
 async function sha256Hex(bytes: Uint8Array): Promise<string> {
-  // Cast to BufferSource: at runtime these bytes are always backed by an
-  // ArrayBuffer (allocated in readBodyBytes), never a SharedArrayBuffer.
   const digest = await crypto.subtle.digest("SHA-256", bytes as BufferSource);
   return Array.from(new Uint8Array(digest), (b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+/**
+ * Cheap structural check: does the byte payload look like a JSON object?
+ * Avoids a 5 MB allocation from a throwaway JSON.parse just to assert this.
+ */
+function looksLikeJsonObject(bytes: Uint8Array): boolean {
+  for (let i = 0; i < bytes.byteLength; i++) {
+    const c = bytes[i];
+    if (c === 0x20 || c === 0x09 || c === 0x0a || c === 0x0d) continue;
+    return c === 0x7b; // '{'
+  }
+  return false;
 }
 
 interface SignedHeaders {
@@ -81,10 +113,8 @@ function extractSignedHeaders(req: Request): SignedHeaders | { error: string } {
 
 /**
  * POST /auth/challenge
- * Body: { address: "0x..." }
- * Issues a single-use nonce bound to the requesting address.
  */
-export async function handleChallenge(req: Request): Promise<Response> {
+export async function handleChallenge(req: Request, reqId: string): Promise<Response> {
   let body: ChallengeRequest;
   try {
     body = await req.json() as ChallengeRequest;
@@ -96,14 +126,14 @@ export async function handleChallenge(req: Request): Promise<Response> {
     return jsonResponse(400, { error: "invalid_address" });
   }
   if (!isRedisConfigured()) {
-    console.error("[challenge] REDIS_URL not configured");
+    console.error(`[challenge] [${reqId}] REDIS_URL not configured`);
     return jsonResponse(503, { error: "redis_not_configured" });
   }
   const nonce = generateNonce();
   try {
     await issueNonce(address, nonce);
   } catch (err) {
-    console.error("[challenge] issueNonce failed:", err);
+    console.error(`[challenge] [${reqId}] issueNonce failed:`, err);
     return jsonResponse(503, { error: "storage_unavailable" });
   }
   const res: ChallengeResponse = { nonce, expires_in: 60 };
@@ -112,24 +142,39 @@ export async function handleChallenge(req: Request): Promise<Response> {
 
 /**
  * POST /themes
- * Headers: x-agent-address, x-nonce, x-timestamp, x-signature
- * Body: raw theme JSON (5 MB max)
  */
-export async function handleSaveTheme(req: Request): Promise<Response> {
+export async function handleSaveTheme(req: Request, reqId: string): Promise<Response> {
+  return await withTimeout(
+    REQUEST_TIMEOUT_MS,
+    (signal) => saveThemeImpl(req, reqId, signal),
+    () => {
+      console.warn(`[save] [${reqId}] request timed out`);
+      return jsonResponse(408, { error: "request_timeout" });
+    },
+  );
+}
+
+async function saveThemeImpl(
+  req: Request,
+  reqId: string,
+  signal: AbortSignal,
+): Promise<Response> {
   const signed = extractSignedHeaders(req);
   if ("error" in signed) return jsonResponse(401, signed);
 
-  const bytes = await readBodyBytes(req, MAX_THEME_BYTES);
+  let bytes: Uint8Array | null;
+  try {
+    bytes = await readBodyBytes(req, MAX_THEME_BYTES, signal);
+  } catch (err) {
+    if ((err as Error).name === "AbortError") {
+      return jsonResponse(408, { error: "request_timeout" });
+    }
+    throw err;
+  }
   if (bytes === null) return jsonResponse(413, { error: "body_too_large" });
   if (bytes.byteLength === 0) return jsonResponse(400, { error: "empty_body" });
 
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(new TextDecoder().decode(bytes));
-  } catch {
-    return jsonResponse(400, { error: "invalid_json" });
-  }
-  if (parsed === null || typeof parsed !== "object") {
+  if (!looksLikeJsonObject(bytes)) {
     return jsonResponse(400, { error: "theme_must_be_object" });
   }
 
@@ -139,7 +184,8 @@ export async function handleSaveTheme(req: Request): Promise<Response> {
   let nonceOwner: string | null;
   try {
     nonceOwner = await consumeNonce(signed.nonce);
-  } catch {
+  } catch (err) {
+    console.error(`[save] [${reqId}] consumeNonce failed:`, err);
     return jsonResponse(503, { error: "storage_unavailable" });
   }
   if (!nonceOwner || nonceOwner.toLowerCase() !== signed.address) {
@@ -156,18 +202,52 @@ export async function handleSaveTheme(req: Request): Promise<Response> {
   if (!verified) return jsonResponse(401, { error: "signature_verification_failed" });
 
   if (!isStorageConfigured()) {
-    console.error("[save] storage env vars are not fully set");
+    console.error(`[save] [${reqId}] storage env vars are not fully set`);
     return jsonResponse(503, { error: "storage_not_configured" });
   }
+
+  // If this hash already exists, return the existing URL without touching the
+  // owner metadata or the owner index — content-addressed themes are immutable
+  // and the first uploader keeps ownership (prevents ownership hijack via
+  // re-upload of identical bytes).
+  let existingMeta;
+  try {
+    existingMeta = await getThemeMeta(bodyHash);
+  } catch (err) {
+    console.error(`[save] [${reqId}] getThemeMeta failed:`, err);
+    return jsonResponse(503, { error: "metadata_read_failed" });
+  }
+  if (existingMeta) {
+    return successResponse(req, bodyHash);
+  }
+
+  // Per-owner quota check (only counts for the inserting owner; dedup hits
+  // above this path don't add to the index).
+  if (MAX_THEMES_PER_OWNER > 0) {
+    let count: number;
+    try {
+      count = await countOwnerThemes(verified);
+    } catch (err) {
+      console.error(`[save] [${reqId}] countOwnerThemes failed:`, err);
+      return jsonResponse(503, { error: "metadata_read_failed" });
+    }
+    if (count >= MAX_THEMES_PER_OWNER) {
+      return jsonResponse(409, {
+        error: "quota_exceeded",
+        limit: MAX_THEMES_PER_OWNER,
+      });
+    }
+  }
+
   const storage = getStorage();
   const contentType = "application/json";
   try {
-    const existing = await storage.headTheme(bodyHash);
-    if (!existing) {
+    const existingBlob = await storage.headTheme(bodyHash);
+    if (!existingBlob) {
       await storage.putTheme(bodyHash, bytes, contentType);
     }
   } catch (err) {
-    console.error("[save] tigris write failed:", err);
+    console.error(`[save] [${reqId}] tigris write failed:`, err);
     return jsonResponse(502, { error: "storage_write_failed" });
   }
 
@@ -180,10 +260,15 @@ export async function handleSaveTheme(req: Request): Promise<Response> {
       content_type: contentType,
     });
     await addOwnerIndex(verified, bodyHash, createdAt);
-  } catch {
+  } catch (err) {
+    console.error(`[save] [${reqId}] metadata write failed:`, err);
     return jsonResponse(503, { error: "metadata_write_failed" });
   }
 
+  return successResponse(req, bodyHash);
+}
+
+function successResponse(req: Request, bodyHash: string): Response {
   const res: SaveThemeResponse = {
     hash: bodyHash,
     url: `${originFor(req)}/themes/${bodyHash}`,
@@ -192,14 +277,38 @@ export async function handleSaveTheme(req: Request): Promise<Response> {
 }
 
 /**
- * GET /themes/:hash — public, streams the blob.
+ * GET /themes/:hash
  */
-export async function handleGetTheme(hash: string): Promise<Response> {
+export async function handleGetTheme(
+  hash: string,
+  reqId: string,
+  headOnly = false,
+): Promise<Response> {
   if (!isValidHash(hash)) return jsonResponse(400, { error: "invalid_hash" });
+  if (headOnly) {
+    let meta;
+    try {
+      meta = await getStorage().headTheme(hash);
+    } catch (err) {
+      console.error(`[get-head] [${reqId}] failed:`, err);
+      return jsonResponse(502, { error: "storage_read_failed" });
+    }
+    if (!meta) return jsonResponse(404, { error: "not_found" });
+    const headers = new Headers({
+      "content-type": "application/json",
+      "cache-control": "public, max-age=31536000, immutable",
+      "access-control-allow-origin": "*",
+    });
+    if (meta.contentLength !== null) {
+      headers.set("content-length", String(meta.contentLength));
+    }
+    return new Response(null, { status: 200, headers });
+  }
   let obj;
   try {
     obj = await getStorage().getThemeStream(hash);
-  } catch {
+  } catch (err) {
+    console.error(`[get] [${reqId}] failed:`, err);
     return jsonResponse(502, { error: "storage_read_failed" });
   }
   if (!obj) return jsonResponse(404, { error: "not_found" });
@@ -215,7 +324,7 @@ export async function handleGetTheme(hash: string): Promise<Response> {
 }
 
 /**
- * GET /themes/:hash/meta — public, returns owner + created_at + size.
+ * GET /themes/:hash/meta
  */
 export async function handleGetThemeMeta(hash: string): Promise<Response> {
   if (!isValidHash(hash)) return jsonResponse(400, { error: "invalid_hash" });
@@ -235,7 +344,7 @@ export async function handleGetThemeMeta(hash: string): Promise<Response> {
 }
 
 /**
- * GET /users/:address/themes?offset=N&limit=M — public listing.
+ * GET /users/:address/themes?offset=N&limit=M
  */
 export async function handleListOwnerThemes(
   address: string,
@@ -247,23 +356,50 @@ export async function handleListOwnerThemes(
   const limitParam = Number(url.searchParams.get("limit") ?? "50") || 50;
   const limit = Math.max(1, Math.min(200, limitParam));
   let hashes: string[];
+  let total: number;
   try {
-    hashes = await listOwnerThemes(addr, offset, limit);
+    [hashes, total] = await Promise.all([
+      listOwnerThemes(addr, offset, limit),
+      countOwnerThemes(addr),
+    ]);
   } catch {
     return jsonResponse(503, { error: "metadata_read_failed" });
   }
+  const nextOffset = offset + hashes.length < total ? offset + hashes.length : null;
   const res: ListOwnerThemesResponse = {
     address: addr,
     hashes,
-    next_offset: hashes.length === limit ? offset + limit : null,
+    next_offset: nextOffset,
   };
-  return jsonResponse(200, res as unknown as Record<string, unknown>);
+  return jsonResponse(200, {
+    ...res as unknown as Record<string, unknown>,
+    total,
+  });
 }
 
 /**
- * DELETE /themes/:hash — owner-only.
+ * DELETE /themes/:hash
  */
-export async function handleDeleteTheme(hash: string, req: Request): Promise<Response> {
+export async function handleDeleteTheme(
+  hash: string,
+  req: Request,
+  reqId: string,
+): Promise<Response> {
+  return await withTimeout(
+    REQUEST_TIMEOUT_MS,
+    () => deleteThemeImpl(hash, req, reqId),
+    () => {
+      console.warn(`[delete] [${reqId}] request timed out`);
+      return jsonResponse(408, { error: "request_timeout" });
+    },
+  );
+}
+
+async function deleteThemeImpl(
+  hash: string,
+  req: Request,
+  reqId: string,
+): Promise<Response> {
   if (!isValidHash(hash)) return jsonResponse(400, { error: "invalid_hash" });
 
   const signed = extractSignedHeaders(req);
@@ -272,7 +408,8 @@ export async function handleDeleteTheme(hash: string, req: Request): Promise<Res
   let nonceOwner: string | null;
   try {
     nonceOwner = await consumeNonce(signed.nonce);
-  } catch {
+  } catch (err) {
+    console.error(`[delete] [${reqId}] consumeNonce failed:`, err);
     return jsonResponse(503, { error: "storage_unavailable" });
   }
   if (!nonceOwner || nonceOwner.toLowerCase() !== signed.address) {
@@ -299,16 +436,22 @@ export async function handleDeleteTheme(hash: string, req: Request): Promise<Res
     return jsonResponse(403, { error: "forbidden" });
   }
 
-  try {
-    await getStorage().deleteTheme(hash);
-  } catch {
-    return jsonResponse(502, { error: "storage_delete_failed" });
-  }
+  // Delete Redis state FIRST so a failure between steps can only leave an
+  // orphan blob (harmless cost) rather than a ghost-theme that public reads
+  // would 404 on. The blob is content-addressed and immutable so deleting it
+  // second is idempotent.
   try {
     await deleteThemeMeta(hash);
     await removeOwnerIndex(verified, hash);
-  } catch {
+  } catch (err) {
+    console.error(`[delete] [${reqId}] metadata delete failed:`, err);
     return jsonResponse(503, { error: "metadata_delete_failed" });
+  }
+  try {
+    await getStorage().deleteTheme(hash);
+  } catch (err) {
+    console.error(`[delete] [${reqId}] tigris delete failed (orphan blob):`, err);
+    return jsonResponse(502, { error: "storage_delete_failed" });
   }
 
   return jsonResponse(200, { ok: true });

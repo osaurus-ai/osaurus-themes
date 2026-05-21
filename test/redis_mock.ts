@@ -92,6 +92,10 @@ export class MockRedis {
     return Promise.resolve(sorted.slice(start, stop + 1));
   }
 
+  zcard(key: string): Promise<number> {
+    return Promise.resolve(this.zsets.get(key)?.size ?? 0);
+  }
+
   expire(key: string, ttl: number): Promise<number> {
     const entry = this.store.get(key);
     if (!entry) return Promise.resolve(0);

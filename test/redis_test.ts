@@ -3,6 +3,7 @@ import {
   _setClientForTesting,
   addOwnerIndex,
   consumeNonce,
+  countOwnerThemes,
   deleteThemeMeta,
   getThemeMeta,
   issueNonce,
@@ -129,4 +130,15 @@ Deno.test("removeOwnerIndex - removes a single hash", async () => {
   await addOwnerIndex(ADDR, "hashB", 2);
   await removeOwnerIndex(ADDR, "hashA");
   assertEquals(await listOwnerThemes(ADDR), ["hashB"]);
+});
+
+Deno.test("countOwnerThemes - returns 0 for no owner, n for n hashes", async () => {
+  const mock = new MockRedis();
+  _setClientForTesting(mock);
+
+  assertEquals(await countOwnerThemes(ADDR), 0);
+  await addOwnerIndex(ADDR, "h1", 1);
+  await addOwnerIndex(ADDR, "h2", 2);
+  await addOwnerIndex(ADDR, "h3", 3);
+  assertEquals(await countOwnerThemes(ADDR), 3);
 });

@@ -52,25 +52,33 @@ osaurus-themes/
 
 All configured via environment variables (use Fly secrets in production):
 
-| Variable                | Required | Description                                                                                                                |
-| ----------------------- | -------- | -------------------------------------------------------------------------------------------------------------------------- |
-| `PORT`                  | no       | HTTP listen port. Default `8080`.                                                                                          |
-| `BASE_URL`              | no       | Public base URL used in returned `url` fields, e.g. `https://themes.osaurus.ai`. Derived from the request `Host` if unset. |
-| `REDIS_URL`             | yes      | Upstash Redis connection string (`rediss://...`).                                                                          |
-| `BUCKET_NAME`           | yes      | Tigris bucket name.                                                                                                        |
-| `AWS_ENDPOINT_URL_S3`   | yes      | Tigris S3 endpoint, e.g. `https://fly.storage.tigris.dev`.                                                                 |
-| `AWS_ACCESS_KEY_ID`     | yes      | Tigris access key.                                                                                                         |
-| `AWS_SECRET_ACCESS_KEY` | yes      | Tigris secret key.                                                                                                         |
-| `AWS_REGION`            | no       | Tigris region (defaults to `auto`).                                                                                        |
-| `S3_FORCE_PATH_STYLE`   | no       | Set to `1` to force path-style S3 URLs. Default off (Tigris uses virtual-hosted style).                                    |
+| Variable                | Required        | Description                                                                                                                                                                                                    |
+| ----------------------- | --------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `PORT`                  | no              | HTTP listen port. Default `8080`.                                                                                                                                                                              |
+| `BASE_URL`              | **recommended** | Public base URL used in returned `url` fields, e.g. `https://themes.osaurus.ai`. If unset the URL is derived from the request `Host` header (spoofable if the app is reachable outside Fly's edge — set this). |
+| `REDIS_URL`             | yes             | Upstash Redis connection string (`rediss://...`).                                                                                                                                                              |
+| `BUCKET_NAME`           | yes             | Tigris bucket name.                                                                                                                                                                                            |
+| `AWS_ENDPOINT_URL_S3`   | yes             | Tigris S3 endpoint, e.g. `https://fly.storage.tigris.dev`.                                                                                                                                                     |
+| `AWS_ACCESS_KEY_ID`     | yes             | Tigris access key.                                                                                                                                                                                             |
+| `AWS_SECRET_ACCESS_KEY` | yes             | Tigris secret key.                                                                                                                                                                                             |
+| `AWS_REGION`            | no              | Tigris region (defaults to `auto`).                                                                                                                                                                            |
+| `S3_FORCE_PATH_STYLE`   | no              | Set to `1` to force path-style S3 URLs. Default off (Tigris uses virtual-hosted style).                                                                                                                        |
+| `MAX_THEMES_PER_OWNER`  | no              | Per-owner theme cap. Default `1000`. Set to `0` to disable.                                                                                                                                                    |
+| `REQUEST_TIMEOUT_MS`    | no              | Hard timeout for `POST /themes` and `DELETE /themes/:hash`. Default `30000`.                                                                                                                                   |
+| `STRICT_ENV`            | no              | If `1`, the process exits at startup when required env vars are missing instead of warning.                                                                                                                    |
 
 ## Endpoints
 
-### `GET /health`
+### `GET /livez`
 
-Liveness + dependency check. Returns `200` when Redis and Tigris are both configured and
-reachable, `503` otherwise. The body always describes the state of each dependency so you can
-diagnose misconfiguration without leaking secrets:
+In-process liveness check. Never touches Redis or Tigris. Use this for Fly's machine health checks
+so a dependency hiccup doesn't kill the VM. Returns `{ "status": "ok" }` with HTTP 200.
+
+### `GET /health` (alias: `/readyz`)
+
+Deep readiness check — verifies Redis and Tigris are configured and reachable. Returns `200` when
+both are OK, `503` otherwise. Result is cached for 5 seconds so external monitors can't hammer the
+dependencies.
 
 ```json
 {
@@ -143,6 +151,11 @@ cheap and returns the same hash.
 Public, unauthenticated. Streams the raw theme JSON with long-lived immutable cache headers. Returns
 `404` if missing.
 
+### `HEAD /themes/:hash`
+
+Cheap "does this theme exist?" check. Same headers as `GET /themes/:hash` (including
+`content-length`) but no body. `200` if present, `404` if not.
+
 ### `GET /themes/:hash/meta`
 
 Public. Returns the theme's owner and creation metadata:
@@ -160,9 +173,12 @@ Public. Lists an owner's theme hashes, newest first. Pagination via `?offset=N&l
 {
   "address": "0x...",
   "hashes": ["<sha256>", "<sha256>", "..."],
-  "next_offset": 50
+  "next_offset": 50,
+  "total": 137
 }
 ```
+
+`next_offset` is `null` when the last page has been reached (i.e. `offset + returned >= total`).
 
 ### `DELETE /themes/:hash`
 
@@ -189,14 +205,22 @@ Returns `200 { "ok": true }`, or `403` if the signing address doesn't own the th
 | 401    | `signature_verification_failed` | EIP-191 signature didn't recover the claimed address                            |
 | 403    | `forbidden`                     | Signing address is not the theme's owner                                        |
 | 404    | `not_found`                     | Theme hash unknown                                                              |
+| 408    | `request_timeout`               | Handler exceeded `REQUEST_TIMEOUT_MS` (default 30s) — usually a slow upload     |
+| 409    | `quota_exceeded`                | Owner reached `MAX_THEMES_PER_OWNER`. Response includes a `limit` field         |
 | 413    | `body_too_large`                | Body exceeded 5 MB (streamed early-abort)                                       |
 | 429    | `rate_limited`                  | Per-endpoint rate limit hit                                                     |
 | 502    | `storage_write_failed`          | Tigris PUT failed                                                               |
 | 502    | `storage_read_failed`           | Tigris GET failed                                                               |
-| 502    | `storage_delete_failed`         | Tigris DELETE failed                                                            |
+| 502    | `storage_delete_failed`         | Tigris DELETE failed (Redis state already cleared — orphan blob)                |
+| 503    | `redis_not_configured`          | `REDIS_URL` missing at startup                                                  |
+| 503    | `storage_not_configured`        | One of `BUCKET_NAME` / `AWS_*` missing at startup                               |
 | 503    | `storage_unavailable`           | Redis nonce write/read failed                                                   |
 | 503    | `metadata_write_failed`         | Redis metadata write failed after a successful upload                           |
 | 503    | `metadata_read_failed`          | Redis metadata read failed                                                      |
+
+Every response includes an `X-Request-ID` header (the client's `X-Request-ID` is echoed if it
+matches `[A-Za-z0-9_.-]{1,64}`, otherwise the server generates one). The same id appears in every
+log line for that request, e.g. `[save] [req_abc123] tigris write failed: ...`.
 
 ## Rate limits
 
