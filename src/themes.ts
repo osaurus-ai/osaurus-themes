@@ -50,7 +50,9 @@ function originFor(req: Request): string {
 }
 
 async function sha256Hex(bytes: Uint8Array): Promise<string> {
-  const digest = await crypto.subtle.digest("SHA-256", bytes);
+  // Cast to BufferSource: at runtime these bytes are always backed by an
+  // ArrayBuffer (allocated in readBodyBytes), never a SharedArrayBuffer.
+  const digest = await crypto.subtle.digest("SHA-256", bytes as BufferSource);
   return Array.from(new Uint8Array(digest), (b) => b.toString(16).padStart(2, "0")).join("");
 }
 
