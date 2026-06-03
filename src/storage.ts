@@ -6,6 +6,7 @@ import {
   PutObjectCommand,
   S3Client,
 } from "@aws-sdk/client-s3";
+import { THEME_CACHE_CONTROL } from "./http.ts";
 
 const BUCKET = Deno.env.get("BUCKET_NAME") ?? "";
 const ENDPOINT = Deno.env.get("AWS_ENDPOINT_URL_S3");
@@ -109,7 +110,7 @@ class TigrisStorage implements StorageClient {
           Key: key(hash),
           Body: body,
           ContentType: contentType,
-          CacheControl: "public, max-age=31536000, immutable",
+          CacheControl: THEME_CACHE_CONTROL,
         }),
       );
     } catch (err) {

@@ -18,7 +18,7 @@ import {
   saveThemeMeta,
 } from "./redis.ts";
 import { getStorage, isStorageConfigured } from "./storage.ts";
-import { jsonResponse, readBodyBytes, withTimeout } from "./http.ts";
+import { jsonResponse, readBodyBytes, THEME_CACHE_CONTROL, withTimeout } from "./http.ts";
 import type {
   ChallengeRequest,
   ChallengeResponse,
@@ -296,7 +296,7 @@ export async function handleGetTheme(
     if (!meta) return jsonResponse(404, { error: "not_found" });
     const headers = new Headers({
       "content-type": "application/json",
-      "cache-control": "public, max-age=31536000, immutable",
+      "cache-control": THEME_CACHE_CONTROL,
       "access-control-allow-origin": "*",
     });
     if (meta.contentLength !== null) {
@@ -314,7 +314,7 @@ export async function handleGetTheme(
   if (!obj) return jsonResponse(404, { error: "not_found" });
   const headers = new Headers({
     "content-type": obj.contentType,
-    "cache-control": "public, max-age=31536000, immutable",
+    "cache-control": THEME_CACHE_CONTROL,
     "access-control-allow-origin": "*",
   });
   if (obj.contentLength !== null) {

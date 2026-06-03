@@ -359,6 +359,9 @@ Deno.test("handleGetTheme - returns stored bytes", async () => {
   const text = await res.text();
   assertEquals(text, JSON.stringify({ x: 1 }));
   assertEquals(res.headers.get("content-type"), "application/json");
+  // no-transform must be present so Deno.serve does not auto-compress the
+  // streamed body (compression truncates the HTTP/2 stream -> client -1005).
+  assert(res.headers.get("cache-control")?.includes("no-transform"));
 });
 
 // --- M4: HEAD ---

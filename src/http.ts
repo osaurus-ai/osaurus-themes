@@ -1,3 +1,9 @@
+// Long-lived caching for immutable, content-addressed theme blobs.
+// `no-transform` is load-bearing: it disables Deno.serve's automatic
+// gzip/brotli compression, which truncates the streamed S3 body over HTTP/2
+// (Deno #19889) and surfaces on clients as NSURLErrorDomain -1005.
+export const THEME_CACHE_CONTROL = "public, max-age=31536000, immutable, no-transform";
+
 export function jsonResponse(
   status: number,
   body: Record<string, unknown>,
